@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2021 Intel Corporation
+* Copyright 2020-2022 Intel Corporation
 * Copyright 2020 Codeplay Software Limited
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,6 +19,7 @@
 #include "gpu/nvidia/sycl_cuda_scoped_context.hpp"
 #include "gpu/nvidia/sycl_cuda_stream.hpp"
 #include "gpu/nvidia/sycl_cuda_utils.hpp"
+#include "sycl_cuda_memory_storage_helper.hpp"
 
 namespace dnnl {
 namespace impl {
@@ -33,33 +34,36 @@ status_t cudnn_convolution_fwd_t::execute_convolution(
     return cuda_stream->interop_task([&](::sycl::handler &cgh) {
         using scratch_acc_t = ::sycl::accessor<uint8_t, 1,
                 ::sycl::access::mode::read_write>;
-        auto x_acc = CTX_IN_ACCESSOR(DNNL_ARG_SRC);
-        auto weights_acc = CTX_IN_ACCESSOR(DNNL_ARG_WEIGHTS);
-        auto y_acc = CTX_OUT_ACCESSOR(DNNL_ARG_DST);
-        std::shared_ptr<
-                ::sycl::accessor<uint8_t, 1, ::sycl::access::mode::read>>
-                bias_acc;
+        auto *x_mem = CTX_IN_MEMORY(DNNL_ARG_SRC);
+        auto *weights_mem = CTX_IN_MEMORY(DNNL_ARG_WEIGHTS);
+        auto *y_mem = CTX_OUT_MEMORY(DNNL_ARG_DST);
+
+        sycl::sycl_memory_storage_base_t *bias_mem;
+        sycl::sycl_memory_storage_base_t *temp_dst_mem;
+        sycl::sycl_memory_storage_base_t *temp_reorder_mem;
+
         std::shared_ptr<scratch_acc_t> scratch_acc;
         std::shared_ptr<scratch_acc_t> filter_scratch_acc;
-        std::shared_ptr<scratch_acc_t> temp_dst_acc;
-        std::shared_ptr<scratch_acc_t> temp_reorder_acc;
+
+        std::optional<::sycl::accessor<uint8_t, 1, ::sycl::access::mode::read>>
+                bias_acc;
+        std::optional<scratch_acc_t> temp_dst_acc;
+        std::optional<scratch_acc_t> temp_reorder_acc;
 
         const bool use_temp_dst = pd()->use_temp_dst();
 
+        auto x_acc = CTX_IN_OPTIONAL_ACCESSOR(DNNL_ARG_SRC, x_mem);
+        auto weights_acc
+                = CTX_IN_OPTIONAL_ACCESSOR(DNNL_ARG_WEIGHTS, weights_mem);
+        auto y_acc = CTX_OUT_OPTIONAL_ACCESSOR(DNNL_ARG_DST, y_mem);
+
         if (with_scratchpad) {
-            scratch_acc = std::make_shared<scratch_acc_t>(
-                    utils::downcast<sycl::sycl_buffer_memory_storage_t *>(
-                            ctx.get_scratchpad_grantor()
-                                    .get_memory_storage(memory_tracking::names::
-                                                    key_conv_cudnn_algo)
-                                    .get())
-                            ->buffer()
-                            .get_access<::sycl::access::mode::read_write>(cgh));
+            scratch_acc = std::make_shared<scratch_acc_t>(CTX_SCRATCH_ACCESSOR(
+                    memory_tracking::names::key_conv_cudnn_algo));
         }
         if (with_bias) {
-            bias_acc = std::make_shared<
-                    ::sycl::accessor<uint8_t, 1, ::sycl::access::mode::read>>(
-                    CTX_IN_ACCESSOR(DNNL_ARG_BIAS));
+            bias_mem = CTX_IN_MEMORY(DNNL_ARG_BIAS);
+            bias_acc = CTX_IN_OPTIONAL_ACCESSOR(DNNL_ARG_BIAS, bias_mem);
         }
         if (pd()->impl_->using_transformed_filter()) {
             filter_scratch_acc
@@ -68,12 +72,14 @@ status_t cudnn_convolution_fwd_t::execute_convolution(
         }
 
         if (use_temp_dst) {
-            temp_dst_acc = std::make_shared<scratch_acc_t>(
-                    buffer(scratch_storage.get())
-                            .get_access<::sycl::access::mode::read_write>(cgh));
-            temp_reorder_acc = std::make_shared<scratch_acc_t>(
-                    buffer(scratch_storage_2.get())
-                            .get_access<::sycl::access::mode::read_write>(cgh));
+            temp_dst_mem = utils::downcast<sycl::sycl_memory_storage_base_t *>(
+                    scratch_storage.get());
+            temp_reorder_mem
+                    = utils::downcast<sycl::sycl_memory_storage_base_t *>(
+                            scratch_storage_2.get());
+            temp_dst_acc = get_cudnn_accessor<scratch_acc_t>(temp_dst_mem, cgh);
+            temp_reorder_acc
+                    = get_cudnn_accessor<scratch_acc_t>(temp_reorder_mem, cgh);
         }
 
         compat::host_task(cgh, [=](const compat::interop_handle &ih) {
@@ -83,21 +89,23 @@ status_t cudnn_convolution_fwd_t::execute_convolution(
             auto handle = cuda_stream->get_cudnn_handle();
 
             std::vector<void *> args;
-            args.push_back(sc.memory<void *>(ih, x_acc));
-            args.push_back(sc.memory<void *>(ih, weights_acc));
-            args.push_back(sc.memory<void *>(ih, y_acc));
-            args.push_back(
-                    with_bias ? sc.memory<void *>(ih, *bias_acc) : nullptr);
-            args.push_back(with_scratchpad ? sc.memory<void *>(ih, *scratch_acc)
-                                           : nullptr);
+            args.push_back(get_cudnn_ptr(sc, ih, x_acc, x_mem));
+            args.push_back(get_cudnn_ptr(sc, ih, weights_acc, weights_mem));
+            args.push_back(get_cudnn_ptr(sc, ih, y_acc, y_mem));
+            args.push_back(with_bias ? get_cudnn_ptr(sc, ih, bias_acc, bias_mem)
+                                     : nullptr);
+            args.push_back(with_scratchpad
+                            ? sc.memory<void *>(ih, *scratch_acc.get())
+                            : nullptr);
             args.push_back(pd()->impl_->using_transformed_filter()
-                            ? sc.memory<void *>(ih, *filter_scratch_acc)
+                            ? sc.memory<void *>(ih, *filter_scratch_acc.get())
                             : nullptr);
-            args.push_back(use_temp_dst ? sc.memory<void *>(ih, *temp_dst_acc)
-                                        : nullptr);
             args.push_back(use_temp_dst
-                            ? sc.memory<void *>(ih, *temp_reorder_acc)
+                            ? get_cudnn_ptr(sc, ih, temp_dst_acc, temp_dst_mem)
                             : nullptr);
+            args.push_back(use_temp_dst ? get_cudnn_ptr(
+                                   sc, ih, temp_reorder_acc, temp_reorder_mem)
+                                        : nullptr);
             pd()->impl_->execute(handle, args);
         });
     });
@@ -111,28 +119,30 @@ status_t cudnn_convolution_bwd_data_t::execute_convolution(
     return cuda_stream->interop_task([&](::sycl::handler &cgh) {
         using scratch_acc_t = ::sycl::accessor<uint8_t, 1,
                 ::sycl::access::mode::read_write>;
-        auto x_acc = CTX_OUT_ACCESSOR(DNNL_ARG_DIFF_SRC);
-        auto weights_acc = CTX_IN_ACCESSOR(DNNL_ARG_WEIGHTS);
-        auto y_acc = CTX_IN_ACCESSOR(DNNL_ARG_DIFF_DST);
-        std::shared_ptr<
-                ::sycl::accessor<uint8_t, 1, ::sycl::access::mode::read>>
+
+        auto *x_mem = CTX_OUT_MEMORY(DNNL_ARG_DIFF_SRC);
+        auto *weights_mem = CTX_IN_MEMORY(DNNL_ARG_WEIGHTS);
+        auto *y_mem = CTX_IN_MEMORY(DNNL_ARG_DIFF_DST);
+
+        sycl::sycl_memory_storage_base_t *bias_mem;
+
+        std::optional<::sycl::accessor<uint8_t, 1, ::sycl::access::mode::read>>
                 bias_acc;
         std::shared_ptr<scratch_acc_t> scratch_acc;
         std::shared_ptr<scratch_acc_t> filter_scratch_acc;
+
+        auto x_acc = CTX_OUT_OPTIONAL_ACCESSOR(DNNL_ARG_DIFF_SRC, x_mem);
+        auto weights_acc
+                = CTX_IN_OPTIONAL_ACCESSOR(DNNL_ARG_WEIGHTS, weights_mem);
+        auto y_acc = CTX_IN_OPTIONAL_ACCESSOR(DNNL_ARG_DIFF_DST, y_mem);
+
         if (with_scratchpad) {
-            scratch_acc = std::make_shared<scratch_acc_t>(
-                    utils::downcast<sycl::sycl_buffer_memory_storage_t *>(
-                            ctx.get_scratchpad_grantor()
-                                    .get_memory_storage(memory_tracking::names::
-                                                    key_conv_cudnn_algo)
-                                    .get())
-                            ->buffer()
-                            .get_access<::sycl::access::mode::read_write>(cgh));
+            scratch_acc = std::make_shared<scratch_acc_t>(CTX_SCRATCH_ACCESSOR(
+                    memory_tracking::names::key_conv_cudnn_algo));
         }
         if (with_bias) {
-            bias_acc = std::make_shared<
-                    ::sycl::accessor<uint8_t, 1, ::sycl::access::mode::read>>(
-                    CTX_IN_ACCESSOR(DNNL_ARG_BIAS));
+            bias_mem = CTX_IN_MEMORY(DNNL_ARG_BIAS);
+            bias_acc = CTX_IN_OPTIONAL_ACCESSOR(DNNL_ARG_BIAS, bias_mem);
         }
         if (pd()->impl_->using_transformed_filter()) {
             filter_scratch_acc
@@ -146,15 +156,16 @@ status_t cudnn_convolution_bwd_data_t::execute_convolution(
             auto handle = cuda_stream->get_cudnn_handle();
 
             std::vector<void *> args;
-            args.push_back(sc.memory<void *>(ih, x_acc));
-            args.push_back(sc.memory<void *>(ih, weights_acc));
-            args.push_back(sc.memory<void *>(ih, y_acc));
-            args.push_back(
-                    with_bias ? sc.memory<void *>(ih, *bias_acc) : nullptr);
-            args.push_back(with_scratchpad ? sc.memory<void *>(ih, *scratch_acc)
-                                           : nullptr);
+            args.push_back(get_cudnn_ptr(sc, ih, x_acc, x_mem));
+            args.push_back(get_cudnn_ptr(sc, ih, weights_acc, weights_mem));
+            args.push_back(get_cudnn_ptr(sc, ih, y_acc, y_mem));
+            args.push_back(with_bias ? get_cudnn_ptr(sc, ih, bias_acc, bias_mem)
+                                     : nullptr);
+            args.push_back(with_scratchpad
+                            ? sc.memory<void *>(ih, *scratch_acc.get())
+                            : nullptr);
             args.push_back(pd()->impl_->using_transformed_filter()
-                            ? sc.memory<void *>(ih, *filter_scratch_acc)
+                            ? sc.memory<void *>(ih, *filter_scratch_acc.get())
                             : nullptr);
             pd()->impl_->execute(handle, args);
         });
@@ -166,14 +177,15 @@ status_t cudnn_convolution_bwd_weights_t::execute_zero_dims(
             = utils::downcast<nvidia::sycl_cuda_stream_t *>(ctx.stream());
 
     return cuda_stream->interop_task([&](::sycl::handler &cgh) {
-        auto weights_acc = CTX_OUT_ACCESSOR(DNNL_ARG_DIFF_WEIGHTS);
-        std::shared_ptr<
-                ::sycl::accessor<uint8_t, 1, ::sycl::access::mode::write>>
+        auto *weights_mem = CTX_OUT_MEMORY(DNNL_ARG_DIFF_WEIGHTS);
+        auto weights_acc
+                = CTX_OUT_OPTIONAL_ACCESSOR(DNNL_ARG_DIFF_WEIGHTS, weights_mem);
+        sycl::sycl_memory_storage_base_t *bias_mem;
+        std::optional<::sycl::accessor<uint8_t, 1, ::sycl::access::mode::write>>
                 bias_acc;
         if (pd()->with_bias()) {
-            bias_acc = std::make_shared<
-                    ::sycl::accessor<uint8_t, 1, ::sycl::access::mode::write>>(
-                    CTX_OUT_ACCESSOR(DNNL_ARG_DIFF_BIAS));
+            bias_mem = CTX_OUT_MEMORY(DNNL_ARG_DIFF_BIAS);
+            bias_acc = CTX_OUT_OPTIONAL_ACCESSOR(DNNL_ARG_DIFF_BIAS, bias_mem);
         }
         compat::host_task(cgh, [=](const compat::interop_handle &ih) {
             auto &sycl_engine = *utils::downcast<sycl_cuda_engine_t *>(
@@ -181,9 +193,10 @@ status_t cudnn_convolution_bwd_weights_t::execute_zero_dims(
             auto sc = cuda_sycl_scoped_context_handler_t(sycl_engine);
             auto handle = cuda_stream->get_cudnn_handle();
 
-            auto weights = sc.memory<void *>(ih, weights_acc);
+            auto weights = get_cudnn_ptr(sc, ih, weights_acc, weights_mem);
             void *bias = nullptr;
-            if (pd()->with_bias()) bias = sc.memory<void *>(ih, *bias_acc);
+            if (pd()->with_bias())
+                bias = get_cudnn_ptr(sc, ih, bias_acc, bias_mem);
             pd()->impl_->execute_set_weights_bias(handle, weights, bias, 0.f);
         });
     });
@@ -196,28 +209,29 @@ status_t cudnn_convolution_bwd_weights_t::execute_convolution(
     return cuda_stream->interop_task([&](::sycl::handler &cgh) {
         using scratch_acc_t = ::sycl::accessor<uint8_t, 1,
                 ::sycl::access::mode::read_write>;
-        auto x_acc = CTX_IN_ACCESSOR(DNNL_ARG_SRC);
-        auto weights_acc = CTX_OUT_ACCESSOR(DNNL_ARG_DIFF_WEIGHTS);
-        auto y_acc = CTX_IN_ACCESSOR(DNNL_ARG_DIFF_DST);
-        std::shared_ptr<
-                ::sycl::accessor<uint8_t, 1, ::sycl::access::mode::write>>
+        auto *x_mem = CTX_IN_MEMORY(DNNL_ARG_SRC);
+        auto *weights_mem = CTX_OUT_MEMORY(DNNL_ARG_DIFF_WEIGHTS);
+        auto *y_mem = CTX_IN_MEMORY(DNNL_ARG_DIFF_DST);
+
+        sycl::sycl_memory_storage_base_t *bias_mem;
+
+        std::optional<::sycl::accessor<uint8_t, 1, ::sycl::access::mode::write>>
                 bias_acc;
         std::shared_ptr<scratch_acc_t> scratch_acc;
         std::shared_ptr<scratch_acc_t> filter_scratch_acc;
+
+        auto x_acc = CTX_IN_OPTIONAL_ACCESSOR(DNNL_ARG_SRC, x_mem);
+        auto weights_acc
+                = CTX_OUT_OPTIONAL_ACCESSOR(DNNL_ARG_DIFF_WEIGHTS, weights_mem);
+        auto y_acc = CTX_IN_OPTIONAL_ACCESSOR(DNNL_ARG_DIFF_DST, y_mem);
+
         if (with_scratchpad) {
-            scratch_acc = std::make_shared<scratch_acc_t>(
-                    utils::downcast<sycl::sycl_buffer_memory_storage_t *>(
-                            ctx.get_scratchpad_grantor()
-                                    .get_memory_storage(memory_tracking::names::
-                                                    key_conv_cudnn_algo)
-                                    .get())
-                            ->buffer()
-                            .get_access<::sycl::access::mode::read_write>(cgh));
+            scratch_acc = std::make_shared<scratch_acc_t>(CTX_SCRATCH_ACCESSOR(
+                    memory_tracking::names::key_conv_cudnn_algo));
         }
         if (with_bias) {
-            bias_acc = std::make_shared<
-                    ::sycl::accessor<uint8_t, 1, ::sycl::access::mode::write>>(
-                    CTX_OUT_ACCESSOR(DNNL_ARG_DIFF_BIAS));
+            bias_mem = CTX_OUT_MEMORY(DNNL_ARG_DIFF_BIAS);
+            bias_acc = CTX_OUT_OPTIONAL_ACCESSOR(DNNL_ARG_DIFF_BIAS, bias_mem);
         }
         if (pd()->impl_->using_transformed_filter()) {
             filter_scratch_acc
@@ -232,15 +246,16 @@ status_t cudnn_convolution_bwd_weights_t::execute_convolution(
             auto handle = cuda_stream->get_cudnn_handle();
 
             std::vector<void *> args;
-            args.push_back(sc.memory<void *>(ih, x_acc));
-            args.push_back(sc.memory<void *>(ih, weights_acc));
-            args.push_back(sc.memory<void *>(ih, y_acc));
-            args.push_back(
-                    with_bias ? sc.memory<void *>(ih, *bias_acc) : nullptr);
-            args.push_back(with_scratchpad ? sc.memory<void *>(ih, *scratch_acc)
-                                           : nullptr);
+            args.push_back(get_cudnn_ptr(sc, ih, x_acc, x_mem));
+            args.push_back(get_cudnn_ptr(sc, ih, weights_acc, weights_mem));
+            args.push_back(get_cudnn_ptr(sc, ih, y_acc, y_mem));
+            args.push_back(with_bias ? get_cudnn_ptr(sc, ih, bias_acc, bias_mem)
+                                     : nullptr);
+            args.push_back(with_scratchpad
+                            ? sc.memory<void *>(ih, *scratch_acc.get())
+                            : nullptr);
             args.push_back(pd()->impl_->using_transformed_filter()
-                            ? sc.memory<void *>(ih, *filter_scratch_acc)
+                            ? sc.memory<void *>(ih, *filter_scratch_acc.get())
                             : nullptr);
             pd()->impl_->execute(handle, args);
         });
