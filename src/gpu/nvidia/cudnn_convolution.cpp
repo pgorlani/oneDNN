@@ -34,13 +34,18 @@ status_t cudnn_convolution_fwd_t::execute_convolution(
     return cuda_stream->interop_task([&](::sycl::handler &cgh) {
         using scratch_acc_t = ::sycl::accessor<uint8_t, 1,
                 ::sycl::access::mode::read_write>;
-        auto *x_mem = CTX_IN_MEMORY(DNNL_ARG_SRC);
-        auto *weights_mem = CTX_IN_MEMORY(DNNL_ARG_WEIGHTS);
-        auto *y_mem = CTX_OUT_MEMORY(DNNL_ARG_DST);
+//      auto *x_mem = CTX_IN_MEMORY(DNNL_ARG_SRC);
+//      auto *weights_mem = CTX_IN_MEMORY(DNNL_ARG_WEIGHTS);
+//      auto *y_mem = CTX_OUT_MEMORY(DNNL_ARG_DST);
+        auto arg_src     = CTX_IN_SYCL_MEMORY(DNNL_ARG_SRC);
+        auto arg_weights = CTX_IN_SYCL_MEMORY(DNNL_ARG_WEIGHTS);
+        auto arg_dst     = CTX_OUT_SYCL_MEMORY(DNNL_ARG_DST);
+
 
         sycl::sycl_memory_storage_base_t *bias_mem;
         sycl::sycl_memory_storage_base_t *temp_dst_mem;
         sycl::sycl_memory_storage_base_t *temp_reorder_mem;
+        sycl_memory_arg<::sycl::access::mode::read> arg_bias;
 
         std::shared_ptr<scratch_acc_t> scratch_acc;
         std::shared_ptr<scratch_acc_t> filter_scratch_acc;
@@ -52,25 +57,26 @@ status_t cudnn_convolution_fwd_t::execute_convolution(
 
         const bool use_temp_dst = pd()->use_temp_dst();
 
-        auto x_acc = CTX_IN_OPTIONAL_ACCESSOR(DNNL_ARG_SRC, x_mem);
-        auto weights_acc
-                = CTX_IN_OPTIONAL_ACCESSOR(DNNL_ARG_WEIGHTS, weights_mem);
-        auto y_acc = CTX_OUT_OPTIONAL_ACCESSOR(DNNL_ARG_DST, y_mem);
+//      auto x_acc = CTX_IN_OPTIONAL_ACCESSOR(DNNL_ARG_SRC, x_mem);
+//      auto weights_acc
+//                = CTX_IN_OPTIONAL_ACCESSOR(DNNL_ARG_WEIGHTS, weights_mem);
+//      auto y_acc = CTX_OUT_OPTIONAL_ACCESSOR(DNNL_ARG_DST, y_mem);
 
         if (with_scratchpad) {
             scratch_acc = std::make_shared<scratch_acc_t>(CTX_SCRATCH_ACCESSOR(
                     memory_tracking::names::key_conv_cudnn_algo));
         }
         if (with_bias) {
-            bias_mem = CTX_IN_MEMORY(DNNL_ARG_BIAS);
-            bias_acc = CTX_IN_OPTIONAL_ACCESSOR(DNNL_ARG_BIAS, bias_mem);
+           /*auto*/ arg_bias = CTX_IN_SYCL_MEMORY(DNNL_ARG_BIAS);
+//         bias_mem = CTX_IN_MEMORY(DNNL_ARG_BIAS);
+//         bias_acc = CTX_IN_OPTIONAL_ACCESSOR(DNNL_ARG_BIAS, bias_mem);
         }
         if (pd()->impl_->using_transformed_filter()) {
             filter_scratch_acc
                     = std::make_shared<scratch_acc_t>(CTX_SCRATCH_ACCESSOR(
                             memory_tracking::names::key_conv_cudnn_filter));
         }
-
+/* HERE
         if (use_temp_dst) {
             temp_dst_mem = utils::downcast<sycl::sycl_memory_storage_base_t *>(
                     scratch_storage.get());
@@ -81,7 +87,7 @@ status_t cudnn_convolution_fwd_t::execute_convolution(
             temp_reorder_acc
                     = get_cudnn_accessor<scratch_acc_t>(temp_reorder_mem, cgh);
         }
-
+*/
         compat::host_task(cgh, [=](const compat::interop_handle &ih) {
             auto &sycl_engine = *utils::downcast<sycl_cuda_engine_t *>(
                     cuda_stream->engine());
@@ -89,23 +95,26 @@ status_t cudnn_convolution_fwd_t::execute_convolution(
             auto handle = cuda_stream->get_cudnn_handle();
 
             std::vector<void *> args;
-            args.push_back(get_cudnn_ptr(sc, ih, x_acc, x_mem));
-            args.push_back(get_cudnn_ptr(sc, ih, weights_acc, weights_mem));
-            args.push_back(get_cudnn_ptr(sc, ih, y_acc, y_mem));
-            args.push_back(with_bias ? get_cudnn_ptr(sc, ih, bias_acc, bias_mem)
+            args.push_back(arg_src.get_native_pointer(ih, sc));     //get_cudnn_ptr(sc, ih, x_acc, x_mem));
+            args.push_back(arg_weights.get_native_pointer(ih, sc)); //get_cudnn_ptr(sc, ih, weights_acc, weights_mem));
+            args.push_back(arg_dst.get_native_pointer(ih, sc));     //get_cudnn_ptr(sc, ih, y_acc, y_mem));
+            args.push_back(with_bias ?
+//get_cudnn_ptr(sc, ih, bias_acc, bias_mem)
+            arg_bias.get_native_pointer(ih, sc)
                                      : nullptr);
-            args.push_back(with_scratchpad
+ 
+           args.push_back(with_scratchpad
                             ? sc.memory<void *>(ih, *scratch_acc.get())
                             : nullptr);
             args.push_back(pd()->impl_->using_transformed_filter()
                             ? sc.memory<void *>(ih, *filter_scratch_acc.get())
                             : nullptr);
-            args.push_back(use_temp_dst
+/*HERE*/   args.push_back(/*use_temp_dst
                             ? get_cudnn_ptr(sc, ih, temp_dst_acc, temp_dst_mem)
-                            : nullptr);
-            args.push_back(use_temp_dst ? get_cudnn_ptr(
+                            :*/ nullptr);
+            args.push_back(/*use_temp_dst ? get_cudnn_ptr(
                                    sc, ih, temp_reorder_acc, temp_reorder_mem)
-                                        : nullptr);
+                                        :*/ nullptr);
             pd()->impl_->execute(handle, args);
         });
     });
@@ -120,29 +129,34 @@ status_t cudnn_convolution_bwd_data_t::execute_convolution(
         using scratch_acc_t = ::sycl::accessor<uint8_t, 1,
                 ::sycl::access::mode::read_write>;
 
-        auto *x_mem = CTX_OUT_MEMORY(DNNL_ARG_DIFF_SRC);
-        auto *weights_mem = CTX_IN_MEMORY(DNNL_ARG_WEIGHTS);
-        auto *y_mem = CTX_IN_MEMORY(DNNL_ARG_DIFF_DST);
+//        auto *x_mem = CTX_OUT_MEMORY(DNNL_ARG_DIFF_SRC);
+//        auto *weights_mem = CTX_IN_MEMORY(DNNL_ARG_WEIGHTS);
+//        auto *y_mem = CTX_IN_MEMORY(DNNL_ARG_DIFF_DST);
+        auto arg_src     = CTX_OUT_SYCL_MEMORY(DNNL_ARG_SRC);
+        auto arg_weights = CTX_IN_SYCL_MEMORY(DNNL_ARG_WEIGHTS);
+        auto arg_dst     = CTX_IN_SYCL_MEMORY(DNNL_ARG_DIFF_DST);
 
         sycl::sycl_memory_storage_base_t *bias_mem;
+        sycl_memory_arg<::sycl::access::mode::read> arg_bias;
 
         std::optional<::sycl::accessor<uint8_t, 1, ::sycl::access::mode::read>>
                 bias_acc;
         std::shared_ptr<scratch_acc_t> scratch_acc;
         std::shared_ptr<scratch_acc_t> filter_scratch_acc;
 
-        auto x_acc = CTX_OUT_OPTIONAL_ACCESSOR(DNNL_ARG_DIFF_SRC, x_mem);
-        auto weights_acc
-                = CTX_IN_OPTIONAL_ACCESSOR(DNNL_ARG_WEIGHTS, weights_mem);
-        auto y_acc = CTX_IN_OPTIONAL_ACCESSOR(DNNL_ARG_DIFF_DST, y_mem);
+//        auto x_acc = CTX_OUT_OPTIONAL_ACCESSOR(DNNL_ARG_DIFF_SRC, x_mem);
+//        auto weights_acc
+//                = CTX_IN_OPTIONAL_ACCESSOR(DNNL_ARG_WEIGHTS, weights_mem);
+//        auto y_acc = CTX_IN_OPTIONAL_ACCESSOR(DNNL_ARG_DIFF_DST, y_mem);
 
         if (with_scratchpad) {
             scratch_acc = std::make_shared<scratch_acc_t>(CTX_SCRATCH_ACCESSOR(
                     memory_tracking::names::key_conv_cudnn_algo));
         }
         if (with_bias) {
-            bias_mem = CTX_IN_MEMORY(DNNL_ARG_BIAS);
-            bias_acc = CTX_IN_OPTIONAL_ACCESSOR(DNNL_ARG_BIAS, bias_mem);
+           auto arg_bias = CTX_IN_SYCL_MEMORY(DNNL_ARG_BIAS);
+//            bias_mem = CTX_IN_MEMORY(DNNL_ARG_BIAS);
+//            bias_acc = CTX_IN_OPTIONAL_ACCESSOR(DNNL_ARG_BIAS, bias_mem);
         }
         if (pd()->impl_->using_transformed_filter()) {
             filter_scratch_acc
@@ -156,10 +170,15 @@ status_t cudnn_convolution_bwd_data_t::execute_convolution(
             auto handle = cuda_stream->get_cudnn_handle();
 
             std::vector<void *> args;
-            args.push_back(get_cudnn_ptr(sc, ih, x_acc, x_mem));
-            args.push_back(get_cudnn_ptr(sc, ih, weights_acc, weights_mem));
-            args.push_back(get_cudnn_ptr(sc, ih, y_acc, y_mem));
-            args.push_back(with_bias ? get_cudnn_ptr(sc, ih, bias_acc, bias_mem)
+            args.push_back(arg_src.get_native_pointer(ih, sc)); //get_cudnn_ptr(sc, ih, x_acc, x_mem));
+            args.push_back(arg_weights.get_native_pointer(ih, sc)); //get_cudnn_ptr(sc, ih, weights_acc, weights_mem));
+            args.push_back(arg_dst.get_native_pointer(ih, sc));//get_cudnn_ptr(sc, ih, y_acc, y_mem));
+//            args.push_back(get_cudnn_ptr(sc, ih, x_acc, x_mem));
+//            args.push_back(get_cudnn_ptr(sc, ih, weights_acc, weights_mem));
+//            args.push_back(get_cudnn_ptr(sc, ih, y_acc, y_mem));
+            args.push_back(with_bias ?
+//get_cudnn_ptr(sc, ih, bias_acc, bias_mem)
+            arg_bias.get_native_pointer(ih, sc)
                                      : nullptr);
             args.push_back(with_scratchpad
                             ? sc.memory<void *>(ih, *scratch_acc.get())
@@ -177,15 +196,21 @@ status_t cudnn_convolution_bwd_weights_t::execute_zero_dims(
             = utils::downcast<nvidia::sycl_cuda_stream_t *>(ctx.stream());
 
     return cuda_stream->interop_task([&](::sycl::handler &cgh) {
-        auto *weights_mem = CTX_OUT_MEMORY(DNNL_ARG_DIFF_WEIGHTS);
-        auto weights_acc
-                = CTX_OUT_OPTIONAL_ACCESSOR(DNNL_ARG_DIFF_WEIGHTS, weights_mem);
-        sycl::sycl_memory_storage_base_t *bias_mem;
+
+//        auto *weights_mem = CTX_OUT_MEMORY(DNNL_ARG_DIFF_WEIGHTS);
+//        auto weights_acc
+//                = CTX_OUT_OPTIONAL_ACCESSOR(DNNL_ARG_DIFF_WEIGHTS, weights_mem);
+
+        auto arg_diff_weights = CTX_OUT_SYCL_MEMORY(DNNL_ARG_DIFF_WEIGHTS);
+
+//        sycl::sycl_memory_storage_base_t *bias_mem;
+        sycl_memory_arg<::sycl::access::mode::write> arg_diff_bias;
         std::optional<::sycl::accessor<uint8_t, 1, ::sycl::access::mode::write>>
                 bias_acc;
         if (pd()->with_bias()) {
-            bias_mem = CTX_OUT_MEMORY(DNNL_ARG_DIFF_BIAS);
-            bias_acc = CTX_OUT_OPTIONAL_ACCESSOR(DNNL_ARG_DIFF_BIAS, bias_mem);
+//            bias_mem = CTX_OUT_MEMORY(DNNL_ARG_DIFF_BIAS);
+//            bias_acc = CTX_OUT_OPTIONAL_ACCESSOR(DNNL_ARG_DIFF_BIAS, bias_mem);
+           /*auto*/ arg_diff_bias = CTX_OUT_SYCL_MEMORY(DNNL_ARG_DIFF_BIAS);
         }
         compat::host_task(cgh, [=](const compat::interop_handle &ih) {
             auto &sycl_engine = *utils::downcast<sycl_cuda_engine_t *>(
@@ -193,10 +218,12 @@ status_t cudnn_convolution_bwd_weights_t::execute_zero_dims(
             auto sc = cuda_sycl_scoped_context_handler_t(sycl_engine);
             auto handle = cuda_stream->get_cudnn_handle();
 
-            auto weights = get_cudnn_ptr(sc, ih, weights_acc, weights_mem);
+//            auto weights = get_cudnn_ptr(sc, ih, weights_acc, weights_mem);
+            void *weights = arg_diff_weights.get_native_pointer(ih, sc);
             void *bias = nullptr;
             if (pd()->with_bias())
-                bias = get_cudnn_ptr(sc, ih, bias_acc, bias_mem);
+               // bias = get_cudnn_ptr(sc, ih, bias_acc, bias_mem);
+                bias = arg_diff_bias.get_native_pointer(ih, sc);
             pd()->impl_->execute_set_weights_bias(handle, weights, bias, 0.f);
         });
     });
@@ -209,29 +236,33 @@ status_t cudnn_convolution_bwd_weights_t::execute_convolution(
     return cuda_stream->interop_task([&](::sycl::handler &cgh) {
         using scratch_acc_t = ::sycl::accessor<uint8_t, 1,
                 ::sycl::access::mode::read_write>;
-        auto *x_mem = CTX_IN_MEMORY(DNNL_ARG_SRC);
-        auto *weights_mem = CTX_OUT_MEMORY(DNNL_ARG_DIFF_WEIGHTS);
-        auto *y_mem = CTX_IN_MEMORY(DNNL_ARG_DIFF_DST);
+//        auto *x_mem = CTX_IN_MEMORY(DNNL_ARG_SRC);
+//        auto *weights_mem = CTX_OUT_MEMORY(DNNL_ARG_DIFF_WEIGHTS);
+//        auto *y_mem = CTX_IN_MEMORY(DNNL_ARG_DIFF_DST);
+        auto arg_src     = CTX_IN_SYCL_MEMORY(DNNL_ARG_SRC);
+        auto arg_weights = CTX_OUT_SYCL_MEMORY(DNNL_ARG_WEIGHTS);
+        auto arg_dst     = CTX_IN_SYCL_MEMORY(DNNL_ARG_DIFF_DST);
 
-        sycl::sycl_memory_storage_base_t *bias_mem;
-
+//        sycl::sycl_memory_storage_base_t *bias_mem;
+        sycl_memory_arg<::sycl::access::mode::write> arg_diff_bias;
         std::optional<::sycl::accessor<uint8_t, 1, ::sycl::access::mode::write>>
                 bias_acc;
         std::shared_ptr<scratch_acc_t> scratch_acc;
         std::shared_ptr<scratch_acc_t> filter_scratch_acc;
 
-        auto x_acc = CTX_IN_OPTIONAL_ACCESSOR(DNNL_ARG_SRC, x_mem);
-        auto weights_acc
-                = CTX_OUT_OPTIONAL_ACCESSOR(DNNL_ARG_DIFF_WEIGHTS, weights_mem);
-        auto y_acc = CTX_IN_OPTIONAL_ACCESSOR(DNNL_ARG_DIFF_DST, y_mem);
+//        auto x_acc = CTX_IN_OPTIONAL_ACCESSOR(DNNL_ARG_SRC, x_mem);
+//        auto weights_acc
+//                = CTX_OUT_OPTIONAL_ACCESSOR(DNNL_ARG_DIFF_WEIGHTS, weights_mem);
+//        auto y_acc = CTX_IN_OPTIONAL_ACCESSOR(DNNL_ARG_DIFF_DST, y_mem);
 
         if (with_scratchpad) {
             scratch_acc = std::make_shared<scratch_acc_t>(CTX_SCRATCH_ACCESSOR(
                     memory_tracking::names::key_conv_cudnn_algo));
         }
         if (with_bias) {
-            bias_mem = CTX_OUT_MEMORY(DNNL_ARG_DIFF_BIAS);
-            bias_acc = CTX_OUT_OPTIONAL_ACCESSOR(DNNL_ARG_DIFF_BIAS, bias_mem);
+            /*auto*/ arg_diff_bias = CTX_OUT_SYCL_MEMORY(DNNL_ARG_DIFF_BIAS);
+            //bias_mem = CTX_OUT_MEMORY(DNNL_ARG_DIFF_BIAS);
+            //bias_acc = CTX_OUT_OPTIONAL_ACCESSOR(DNNL_ARG_DIFF_BIAS, bias_mem);
         }
         if (pd()->impl_->using_transformed_filter()) {
             filter_scratch_acc
@@ -246,10 +277,15 @@ status_t cudnn_convolution_bwd_weights_t::execute_convolution(
             auto handle = cuda_stream->get_cudnn_handle();
 
             std::vector<void *> args;
-            args.push_back(get_cudnn_ptr(sc, ih, x_acc, x_mem));
-            args.push_back(get_cudnn_ptr(sc, ih, weights_acc, weights_mem));
-            args.push_back(get_cudnn_ptr(sc, ih, y_acc, y_mem));
-            args.push_back(with_bias ? get_cudnn_ptr(sc, ih, bias_acc, bias_mem)
+//            args.push_back(get_cudnn_ptr(sc, ih, x_acc, x_mem));
+//            args.push_back(get_cudnn_ptr(sc, ih, weights_acc, weights_mem));
+//            args.push_back(get_cudnn_ptr(sc, ih, y_acc, y_mem));
+            args.push_back(arg_src.get_native_pointer(ih, sc)); //get_cudnn_ptr(sc, ih, x_acc, x_mem));
+            args.push_back(arg_weights.get_native_pointer(ih, sc)); //get_cudnn_ptr(sc, ih, weights_acc, weights_mem));
+            args.push_back(arg_dst.get_native_pointer(ih, sc));//get_cudnn_ptr(sc, ih, y_acc, y_mem));
+            args.push_back(with_bias ?
+//get_cudnn_ptr(sc, ih, bias_acc, bias_mem)
+            arg_diff_bias.get_native_pointer(ih, sc)
                                      : nullptr);
             args.push_back(with_scratchpad
                             ? sc.memory<void *>(ih, *scratch_acc.get())
